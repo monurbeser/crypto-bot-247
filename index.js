@@ -1,21 +1,23 @@
 const axios = require('axios');
-const http = require('http'); // HTTP Sunucusu eklendi
+const http = require('http');
 
-// --- RENDER İÇİN YALANCI WEB SERVER (PORT BINDING) ---
-// Bu kısım Render'ın "Port scan timeout" hatasını çözer.
-const PORT = process.env.PORT || 3000;
+// --- RENDER PORT AYARI (KRİTİK DÜZELTME) ---
+// 0.0.0.0 adresi, uygulamanın dış dünyadan erişilebilir olmasını sağlar.
+const PORT = process.env.PORT || 10000; // Render genelde 10000 kullanır
+
 const server = http.createServer((req, res) => {
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/plain');
-    res.end('AI Predator Bot Calisiyor! (Bu sayfa botun uyumamasi icindir)');
+    res.end('Bot Aktif: ' + new Date().toISOString());
 });
 
-server.listen(PORT, () => {
-    console.log(`Web sunucusu ${PORT} portunda başlatıldı.`);
+// BURASI ÇOK ÖNEMLİ: '0.0.0.0' parametresi eklendi
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Sunucu ${PORT} portunda ve 0.0.0.0 adresinde dinleniyor.`);
 });
 // -----------------------------------------------------
 
-// --- AYARLAR ---
+// --- BOT AYARLARI ---
 const DISCORD_URL = process.env.DISCORD_URL; 
 const SHEET_URL = process.env.SHEET_URL; 
 const SENSITIVITY = process.env.SENSITIVITY || 50; 
@@ -23,27 +25,32 @@ const API_URL = 'https://api.binance.com/api/v3/ticker/24hr';
 
 let sentAlerts = {}; 
 
-console.log(`ULTRA BOT BAŞLATILDI... Hassasiyet: %${SENSITIVITY}`);
+console.log(`BOT BASLATILIYOR... Hassasiyet: ${SENSITIVITY}`);
 
-if (!DISCORD_URL) {
-    console.error("UYARI: Discord URL yok. Bildirim gitmeyecek.");
-}
-
-// Dakikada bir çalıştır
+// Döngüyü Başlat
 setInterval(runAnalysis, 60 * 1000);
-// İlk açılışta verilerin yüklenmesi için 2 saniye bekle
-setTimeout(runAnalysis, 2000);
+setTimeout(runAnalysis, 3000); // Sunucu açıldıktan 3sn sonra ilk taramayı yap
 
 async function runAnalysis() {
     try {
+        // Saat Ayarı (Türkiye)
         const now = new Date();
         const timeStr = now.toLocaleTimeString('tr-TR', { 
             timeZone: 'Europe/Istanbul', 
             hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' 
         });
 
-        console.log(`[${timeStr}] Piyasa taranıyor...`);
-        const response = await axios.get(API_URL);
+        console.log(`[${timeStr}] Tarama basladi...`);
+        
+        // Hata Yönetimi: Axios ile veri çekme
+        let response;
+        try {
+            response = await axios.get(API_URL);
+        } catch (apiErr) {
+            console.error("Binance API Hatasi:", apiErr.message);
+            return; // API çalışmıyorsa bu turu pas geç
+        }
+        
         const data = response.data;
 
         // 1. Filtreleme
@@ -55,8 +62,7 @@ async function runAnalysis() {
 
         // 2. Analiz
         const analyzed = coins.map(analyzeCoin);
-        analyzed.sort((a, b) => b.finalScore - a.finalScore);
-
+        
         // 3. Baraj
         const threshold = 90 - (SENSITIVITY * 0.40);
 
@@ -64,18 +70,17 @@ async function runAnalysis() {
         for (const coin of analyzed) {
             if (coin.finalScore >= threshold && coin.finalScore > 60) {
                 const lastSent = sentAlerts[coin.sym] || 0;
-                if (Date.now() - lastSent > 60 * 60 * 1000) { 
-                    
+                // 45 Dakika Spam Koruması
+                if (Date.now() - lastSent > 45 * 60 * 1000) { 
                     await sendDiscordAlert(coin, timeStr);
                     if (SHEET_URL) await logToSheets(coin, timeStr);
-
                     sentAlerts[coin.sym] = Date.now();
                 }
             }
         }
 
     } catch (error) {
-        console.error("Döngü Hatası:", error.message);
+        console.error("Genel Hata:", error.message);
     }
 }
 
@@ -126,41 +131,25 @@ function analyzeCoin(ticker) {
 
 async function sendDiscordAlert(coin, timeStr) {
     if (!DISCORD_URL) return;
-    
     const isLong = coin.direction === 'LONG';
     const color = isLong ? 3066993 : 15158332; 
-
     const embed = {
         title: `${isLong ? '🟢 GÜÇLÜ AL' : '🔴 GÜÇLÜ SAT'}: ${coin.sym}`,
-        description: `⏱ **Saat:** ${timeStr}\n📊 **Puan:** ${Math.floor(coin.finalScore)}\n💰 **Fiyat:** $${coin.price}\n\n🎯 **Hedef (TP):** $${coin.tp.toFixed(4)}\n🛡️ **Stop (SL):** $${coin.sl.toFixed(4)}\n⚖️ **R/R:** ${coin.riskReward}\n\n💡 **AI Analizi:** ${coin.reason}\n🚀 **Önerilen Kaldıraç:** ${coin.leverage}`,
+        description: `⏱ **Saat:** ${timeStr}\n📊 **Puan:** ${Math.floor(coin.finalScore)}\n💰 **Fiyat:** $${coin.price}\n\n🎯 **Hedef:** $${coin.tp.toFixed(4)}\n🛡️ **Stop:** $${coin.sl.toFixed(4)}\n⚖️ **R/R:** ${coin.riskReward}\n\n💡 **AI:** ${coin.reason}\n🚀 **Lev:** ${coin.leverage}`,
         color: color,
-        footer: { text: "AI Predator Backtest Logger" }
+        footer: { text: "AI Predator Cloud" }
     };
-
     try {
-        await axios.post(DISCORD_URL, {
-            username: "Crypto Sniper",
-            embeds: [embed]
-        });
-        console.log(`Discord gönderildi: ${coin.sym}`);
-    } catch (err) {
-        console.error("Discord Hatası");
-    }
+        await axios.post(DISCORD_URL, { username: "Crypto Bot 24/7", embeds: [embed] });
+        console.log(`Discord OK: ${coin.sym}`);
+    } catch (err) { console.error("Discord Hata"); }
 }
 
 async function logToSheets(coin, timeStr) {
     try {
         await axios.post(SHEET_URL, {
-            date: timeStr,
-            symbol: coin.sym,
-            type: coin.direction,
-            price: coin.price,
-            tp: coin.tp.toFixed(4),
-            sl: coin.sl.toFixed(4),
-            score: Math.floor(coin.finalScore)
+            date: timeStr, symbol: coin.sym, type: coin.direction, price: coin.price, tp: coin.tp.toFixed(4), sl: coin.sl.toFixed(4), score: Math.floor(coin.finalScore)
         });
-        console.log(`Google Sheets'e işlendi: ${coin.sym}`);
-    } catch (err) {
-        console.error("Sheets Hatası:", err.message);
-    }
+        console.log(`Sheet OK: ${coin.sym}`);
+    } catch (err) { console.error("Sheet Hata"); }
 }
