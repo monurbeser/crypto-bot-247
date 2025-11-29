@@ -1,12 +1,27 @@
 const axios = require('axios');
+const http = require('http'); // HTTP Sunucusu eklendi
+
+// --- RENDER İÇİN YALANCI WEB SERVER (PORT BINDING) ---
+// Bu kısım Render'ın "Port scan timeout" hatasını çözer.
+const PORT = process.env.PORT || 3000;
+const server = http.createServer((req, res) => {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/plain');
+    res.end('AI Predator Bot Calisiyor! (Bu sayfa botun uyumamasi icindir)');
+});
+
+server.listen(PORT, () => {
+    console.log(`Web sunucusu ${PORT} portunda başlatıldı.`);
+});
+// -----------------------------------------------------
 
 // --- AYARLAR ---
 const DISCORD_URL = process.env.DISCORD_URL; 
-const SHEET_URL = process.env.SHEET_URL; // Google Apps Script Linki
+const SHEET_URL = process.env.SHEET_URL; 
 const SENSITIVITY = process.env.SENSITIVITY || 50; 
 const API_URL = 'https://api.binance.com/api/v3/ticker/24hr';
 
-let sentAlerts = {}; // Spam koruması
+let sentAlerts = {}; 
 
 console.log(`ULTRA BOT BAŞLATILDI... Hassasiyet: %${SENSITIVITY}`);
 
@@ -16,11 +31,11 @@ if (!DISCORD_URL) {
 
 // Dakikada bir çalıştır
 setInterval(runAnalysis, 60 * 1000);
-runAnalysis();
+// İlk açılışta verilerin yüklenmesi için 2 saniye bekle
+setTimeout(runAnalysis, 2000);
 
 async function runAnalysis() {
     try {
-        // Türkiye Saati ile Tarih/Saat Formatı (dd/MM HH:mm)
         const now = new Date();
         const timeStr = now.toLocaleTimeString('tr-TR', { 
             timeZone: 'Europe/Istanbul', 
@@ -47,15 +62,11 @@ async function runAnalysis() {
 
         // 4. İşlem
         for (const coin of analyzed) {
-            // Puan barajı geçildiyse VE daha önce bu coin gönderilmediyse (veya 1 saat geçtiyse)
             if (coin.finalScore >= threshold && coin.finalScore > 60) {
                 const lastSent = sentAlerts[coin.sym] || 0;
-                if (Date.now() - lastSent > 60 * 60 * 1000) { // 1 Saat bekleme
+                if (Date.now() - lastSent > 60 * 60 * 1000) { 
                     
-                    // A) Discord Bildirimi Gönder
                     await sendDiscordAlert(coin, timeStr);
-                    
-                    // B) Google Sheets'e Kaydet
                     if (SHEET_URL) await logToSheets(coin, timeStr);
 
                     sentAlerts[coin.sym] = Date.now();
@@ -78,12 +89,11 @@ function analyzeCoin(ticker) {
 
     let techScore = 40;
     
-    // Teknik Puanlama
     if (change > 2) techScore += 10;
     if (change > 5) techScore += 10;
     if (rangePos > 0.8) techScore += 10;
     if (rangePos < 0.15 && change < -3) techScore += 15;
-    if (Math.abs(change) > 10) techScore += 5; // Volatilite bonusu
+    if (Math.abs(change) > 10) techScore += 5; 
 
     let direction = "NÖTR";
     let reason = "Yatay";
@@ -95,35 +105,22 @@ function analyzeCoin(ticker) {
         direction = "SHORT"; reason = "Aşırı Alım"; techScore = 75;
     }
 
-    // --- YENİ ÖZELLİK: Kaliteye Göre Dinamik TP/SL ---
     let tp, sl, riskReward;
-    
     if (direction === "LONG") {
         if (techScore > 80) {
-            // Çok Güçlü Sinyal: Hedefi büyüt, stopu daralt
-            tp = price * 1.06; // %6 Hedef
-            sl = price * 0.985; // %1.5 Stop
-            riskReward = "Agresif (1:4)";
+            tp = price * 1.06; sl = price * 0.985; riskReward = "Agresif (1:4)";
         } else {
-            // Normal Sinyal
-            tp = price * 1.03; // %3 Hedef
-            sl = price * 0.98; // %2 Stop
-            riskReward = "Standart (1:1.5)";
+            tp = price * 1.03; sl = price * 0.98; riskReward = "Standart (1:1.5)";
         }
-    } else { // SHORT
+    } else { 
         if (techScore > 80) {
-            tp = price * 0.94; 
-            sl = price * 1.015;
-            riskReward = "Agresif (1:4)";
+            tp = price * 0.94; sl = price * 1.015; riskReward = "Agresif (1:4)";
         } else {
-            tp = price * 0.97;
-            sl = price * 1.02;
-            riskReward = "Standart (1:1.5)";
+            tp = price * 0.97; sl = price * 1.02; riskReward = "Standart (1:1.5)";
         }
     }
 
     let leverage = techScore > 80 ? "20x" : (techScore > 65 ? "10x" : "5x");
-
     return { sym, price, change, finalScore: techScore, direction, leverage, tp, sl, reason, riskReward };
 }
 
