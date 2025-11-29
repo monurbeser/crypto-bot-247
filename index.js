@@ -1,56 +1,70 @@
 const axios = require('axios');
 
 // --- AYARLAR ---
-const DISCORD_URL = process.env.DISCORD_URL; // Render ayarlarından çekecek
-const SENSITIVITY = process.env.SENSITIVITY || 50; // Varsayılan 50
+const DISCORD_URL = process.env.DISCORD_URL; 
+const SHEET_URL = process.env.SHEET_URL; // Google Apps Script Linki
+const SENSITIVITY = process.env.SENSITIVITY || 50; 
 const API_URL = 'https://api.binance.com/api/v3/ticker/24hr';
 
-// Spam Koruması (Hafıza)
-let sentAlerts = {};
+let sentAlerts = {}; // Spam koruması
 
-console.log(`BOT BAŞLATILDI... Hassasiyet: %${SENSITIVITY}`);
+console.log(`ULTRA BOT BAŞLATILDI... Hassasiyet: %${SENSITIVITY}`);
 
 if (!DISCORD_URL) {
-    console.error("HATA: Discord URL bulunamadı! Lütfen Environment Variable ekleyin.");
-    process.exit(1);
+    console.error("UYARI: Discord URL yok. Bildirim gitmeyecek.");
 }
 
-// Ana Döngü (Her 1 dakikada bir çalışır)
+// Dakikada bir çalıştır
 setInterval(runAnalysis, 60 * 1000);
-runAnalysis(); // İlk başlatmada hemen çalıştır
+runAnalysis();
 
 async function runAnalysis() {
     try {
-        console.log(`[${new Date().toLocaleTimeString()}] Piyasa taranıyor...`);
+        // Türkiye Saati ile Tarih/Saat Formatı (dd/MM HH:mm)
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString('tr-TR', { 
+            timeZone: 'Europe/Istanbul', 
+            hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' 
+        });
+
+        console.log(`[${timeStr}] Piyasa taranıyor...`);
         const response = await axios.get(API_URL);
         const data = response.data;
 
-        // 1. Filtreleme (USDT ve Hacim)
+        // 1. Filtreleme
         let coins = data.filter(t => 
             t.symbol.endsWith('USDT') && 
-            parseFloat(t.quoteVolume) > 5000000 && 
+            parseFloat(t.quoteVolume) > 10000000 && 
             !t.symbol.includes('DOWN') && !t.symbol.includes('UP')
         );
 
-        // 2. Analiz Et
+        // 2. Analiz
         const analyzed = coins.map(analyzeCoin);
-        
-        // 3. Puan Sıralaması
         analyzed.sort((a, b) => b.finalScore - a.finalScore);
 
-        // 4. Baraj Puanı (Slider Mantığı)
+        // 3. Baraj
         const threshold = 90 - (SENSITIVITY * 0.40);
-        console.log(`Baraj Puanı: ${threshold}`);
 
-        // 5. Sinyal Kontrolü
-        analyzed.forEach(coin => {
+        // 4. İşlem
+        for (const coin of analyzed) {
+            // Puan barajı geçildiyse VE daha önce bu coin gönderilmediyse (veya 1 saat geçtiyse)
             if (coin.finalScore >= threshold && coin.finalScore > 60) {
-                checkAndSendAlert(coin);
+                const lastSent = sentAlerts[coin.sym] || 0;
+                if (Date.now() - lastSent > 60 * 60 * 1000) { // 1 Saat bekleme
+                    
+                    // A) Discord Bildirimi Gönder
+                    await sendDiscordAlert(coin, timeStr);
+                    
+                    // B) Google Sheets'e Kaydet
+                    if (SHEET_URL) await logToSheets(coin, timeStr);
+
+                    sentAlerts[coin.sym] = Date.now();
+                }
             }
-        });
+        }
 
     } catch (error) {
-        console.error("API Hatası:", error.message);
+        console.error("Döngü Hatası:", error.message);
     }
 }
 
@@ -64,58 +78,92 @@ function analyzeCoin(ticker) {
 
     let techScore = 40;
     
-    // Puanlama Algoritması
+    // Teknik Puanlama
     if (change > 2) techScore += 10;
     if (change > 5) techScore += 10;
-    if (rangePos > 0.75) techScore += 10;
+    if (rangePos > 0.8) techScore += 10;
     if (rangePos < 0.15 && change < -3) techScore += 15;
-    if (Math.abs(change) > 15) techScore += 5;
+    if (Math.abs(change) > 10) techScore += 5; // Volatilite bonusu
 
     let direction = "NÖTR";
     let reason = "Yatay";
 
     if (techScore >= 60) {
-        if (rangePos > 0.65) { direction = "LONG"; reason = "Trend Güçlü"; }
+        if (rangePos > 0.7) { direction = "LONG"; reason = "Trend Güçlü"; }
         else if (rangePos < 0.2) { direction = "LONG"; reason = "Dip Tepkisi"; }
-    } else if (change > 12 && rangePos > 0.9) {
-        direction = "SHORT"; reason = "Aşırı Alım"; techScore = 70;
+    } else if (change > 15 && rangePos > 0.95) {
+        direction = "SHORT"; reason = "Aşırı Alım"; techScore = 75;
+    }
+
+    // --- YENİ ÖZELLİK: Kaliteye Göre Dinamik TP/SL ---
+    let tp, sl, riskReward;
+    
+    if (direction === "LONG") {
+        if (techScore > 80) {
+            // Çok Güçlü Sinyal: Hedefi büyüt, stopu daralt
+            tp = price * 1.06; // %6 Hedef
+            sl = price * 0.985; // %1.5 Stop
+            riskReward = "Agresif (1:4)";
+        } else {
+            // Normal Sinyal
+            tp = price * 1.03; // %3 Hedef
+            sl = price * 0.98; // %2 Stop
+            riskReward = "Standart (1:1.5)";
+        }
+    } else { // SHORT
+        if (techScore > 80) {
+            tp = price * 0.94; 
+            sl = price * 1.015;
+            riskReward = "Agresif (1:4)";
+        } else {
+            tp = price * 0.97;
+            sl = price * 1.02;
+            riskReward = "Standart (1:1.5)";
+        }
     }
 
     let leverage = techScore > 80 ? "20x" : (techScore > 65 ? "10x" : "5x");
-    const tp = direction === "LONG" ? price * 1.03 : price * 0.97;
-    const sl = direction === "LONG" ? price * 0.98 : price * 1.02;
 
-    return { sym, price, change, finalScore: techScore, direction, leverage, tp, sl, reason };
+    return { sym, price, change, finalScore: techScore, direction, leverage, tp, sl, reason, riskReward };
 }
 
-async function checkAndSendAlert(coin) {
-    const now = Date.now();
-    const lastSent = sentAlerts[coin.sym] || 0;
+async function sendDiscordAlert(coin, timeStr) {
+    if (!DISCORD_URL) return;
+    
+    const isLong = coin.direction === 'LONG';
+    const color = isLong ? 3066993 : 15158332; 
 
-    // 30 Dakika Spam Koruması
-    if (now - lastSent > 30 * 60 * 1000) {
-        console.log(`Sinyal Bulundu: ${coin.sym} - Puan: ${coin.finalScore}`);
-        
-        const isLong = coin.direction === 'LONG';
-        const color = isLong ? 3066993 : 15158332; // Yeşil veya Kırmızı
+    const embed = {
+        title: `${isLong ? '🟢 GÜÇLÜ AL' : '🔴 GÜÇLÜ SAT'}: ${coin.sym}`,
+        description: `⏱ **Saat:** ${timeStr}\n📊 **Puan:** ${Math.floor(coin.finalScore)}\n💰 **Fiyat:** $${coin.price}\n\n🎯 **Hedef (TP):** $${coin.tp.toFixed(4)}\n🛡️ **Stop (SL):** $${coin.sl.toFixed(4)}\n⚖️ **R/R:** ${coin.riskReward}\n\n💡 **AI Analizi:** ${coin.reason}\n🚀 **Önerilen Kaldıraç:** ${coin.leverage}`,
+        color: color,
+        footer: { text: "AI Predator Backtest Logger" }
+    };
 
-        const embed = {
-            title: `${isLong ? '🟢 GÜÇLÜ AL' : '🔴 GÜÇLÜ SAT'}: ${coin.sym}`,
-            description: `**Puan:** ${Math.floor(coin.finalScore)}\n**Fiyat:** $${coin.price}\n**Kaldıraç:** ${coin.leverage}\n**Neden:** ${coin.reason}\n\n🎯 Hedef: $${coin.tp.toFixed(4)}\n🛑 Stop: $${coin.sl.toFixed(4)}`,
-            color: color,
-            footer: { text: "AI Predator 24/7 Cloud Bot" },
-            timestamp: new Date().toISOString()
-        };
+    try {
+        await axios.post(DISCORD_URL, {
+            username: "Crypto Sniper",
+            embeds: [embed]
+        });
+        console.log(`Discord gönderildi: ${coin.sym}`);
+    } catch (err) {
+        console.error("Discord Hatası");
+    }
+}
 
-        try {
-            await axios.post(DISCORD_URL, {
-                username: "Crypto Bot 24/7",
-                embeds: [embed]
-            });
-            sentAlerts[coin.sym] = now;
-            console.log("Discord bildirimi gönderildi.");
-        } catch (err) {
-            console.error("Discord Gönderim Hatası:", err.message);
-        }
+async function logToSheets(coin, timeStr) {
+    try {
+        await axios.post(SHEET_URL, {
+            date: timeStr,
+            symbol: coin.sym,
+            type: coin.direction,
+            price: coin.price,
+            tp: coin.tp.toFixed(4),
+            sl: coin.sl.toFixed(4),
+            score: Math.floor(coin.finalScore)
+        });
+        console.log(`Google Sheets'e işlendi: ${coin.sym}`);
+    } catch (err) {
+        console.error("Sheets Hatası:", err.message);
     }
 }
